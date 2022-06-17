@@ -1,0 +1,196 @@
+Description: >
+    Isaac Ndarwa / Udacity Cloud DevOps Engineer ND Project 2
+    Deploy VPC, with 2 public and private subnets spread across two AZs.
+    Deploys an IGW, with a default route on the public subnets.
+    Deploys 2 NAT Gateways across AZs,& default routes for them in the private subnets.
+
+Parameters:
+  EnvironmentName:
+      Description: Environment name to be prefixed to resource names
+      Type: String
+
+  AppImageId:
+    Description: Ubuntu 18.04 LTS AMI ID
+    Type: String
+    Default: ami-0729e439b6769d6ab
+
+Resources:
+  # Create IAM Role for S3 Read Only Access
+  UdacityS3ReadOnlyEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role to use the S3 Service
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+
+# instace profile contains the IAM Role name(s) to associate to our auto scaling EC2 Servers
+  ProfileWithRolesForApp:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref UdacityS3ReadOnlyEC2
+
+  # Load Balancer Security Group
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to the load balancer
+      # VPC where resource is to be deployed. Importing from previous stack output
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+
+  # Web Server Security Group
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to the hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      # Comment out this section when ssh access no longer needed, then update stack
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      # Allow all outbound traffic for the server to have unrestricted access to the internet
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+  
+  # AutoScaling Group launches servers based on a certain criteria
+  # It uses the LaunchConfiguration as a configuration template to launch servers
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt-get update -y
+          sudo apt-get install apache2 -y
+          sudo systemctl start apache2.service
+          cd /var/www/html
+          echo "<h1>Isaac's Udagram IaC Project</h1>" > index.html
+          echo "<h3>Amazing! It works!! Udagram, Udacity</h3>" >> index.html
+          echo "Udacity Demo Web Server Up and Running!" >> index.html          
+      ImageId: !Ref AppImageId
+      IamInstanceProfile: !Ref ProfileWithRolesForApp
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: t3.medium
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          # Hard drive size - 10GBs
+          VolumeSize: '10'
+
+  # The autoscaling group
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      # Can set min to 2 due to costs
+      MinSize: '2'
+      MaxSize: '4'
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+  # The LB
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: HTTP
+
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+  
+  # Performs healthchecks on instances of the autoscaling group
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Time to determine non-responsive target is unhealthy
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      # Uses HTTP Protocol to perform health checks on targets
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      # number of health checks passed to change unhealthy to healthy status
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      # number of health checks failed to change healthy to unhealthy status
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID" 
+
+Outputs:
+
+  LoadBalancer:
+    Description: Output reference for the LB
+    Value: !Ref WebAppLB
+
+  LoadBalancerUrl:
+    Description: Output LB URL
+    Value: !Join ["", [ "http://", !GetAtt WebAppLB.DNSName ] ]
